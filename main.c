@@ -1,14 +1,14 @@
 //
-// main.c - Trinamic TMC2130 stepper driver I2C <> SPI bridge for up to 8 drivers
+// main.c - Trinamic TMC2130 stepper driver I2C <> SPI bridge for up to 8 drivers (currently supports 3)
 //
 // Target: MSP430G2553
 //
-// v0.1 / 2018-11-11 / Io Engineering / Terje
+// v0.0.3 / 2019-07-23 / Io Engineering / Terje
 //
 
 /*
 
-Copyright (c) 2018, Terje Io
+Copyright (c) 2018-2019, Terje Io
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without modification,
@@ -47,9 +47,12 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "trinamic/TMC2130_I2C_map.h"
 
 typedef struct {
+    uint8_t otpw_count;
+    uint8_t otpw_max;
     uint8_t cs_pin;
-    uint8_t addr;
-    uint8_t payload[5];
+    TMC2130_datagram_t reg;
+    TMC2130_drv_status_dgr_t status;
+    TMC2130_status_t response;
 } trinamic2130_t;
 
 typedef enum {
@@ -62,9 +65,12 @@ typedef enum {
 } i2c_state;
 
 typedef enum {
-    CMD_Idle,
-    CMD_ReadRegister,
-    I2C_WriteRegister
+    CMD_Idle = 0,
+    CMD_ReadRegister = 0x01,
+    I2C_WriteRegister = 0x02,
+    I2C_WriteEnable = 0x04,
+    I2C_Diag1Event = 0x08,
+    I2C_PollEvent = 0x10 // every 500 mS
 } i2c_cmd;
 
 typedef struct {
@@ -73,106 +79,307 @@ typedef struct {
     uint16_t rx_count;
     uint8_t *rx_data;
     volatile uint16_t tx_count;
+    volatile bool rx_pending;
     uint8_t *tx_data;
     uint8_t data[5];
 } i2c_trans_t;
 
 static i2c_trans_t i2c;
+static trinamic2130_t driver[NUM_AXIS], *active;
+static tmc_axes_t diag1_event = {0};
+static TMCI2C_status_t drvstat = {0};
+static TMCI2C_monitor_status_reg_t diag_data = {0};
+static TMCI2C_enable_dgr_t axes = {
+   .addr = TMC_I2CReg_ENABLE,
+   .reg.value = 0
+};
 
-static trinamic2130_t driver[3], *active;
-
-static void writeRegister (void)
+// Notify host about DIAG1 event
+static void diag1Event (void)
 {
-    uint8_t *payload = active->payload;
+    DIAG1_IRQ_DIR |= DIAG1_IRQ_PIN;
+    DIAG1_IRQ_OUT &= ~DIAG1_IRQ_PIN;
 
-    CS_PORT_OUT &= ~active->cs_pin;
+    drvstat.stalled.mask = diag1_event.mask;
 
-    __delay_cycles(2);
+    diag1_event.mask = 0;
 
-    while(UCA0STAT & UCBUSY);   // Wait for buffer
-    UCA0TXBUF = *payload++;     // Transmit payload byte
+    __delay_cycles(32); // ~1uS IRQ pulse
 
-    while(UCA0STAT & UCBUSY);   // Wait for buffer
-    UCA0TXBUF = *payload++;     // Transmit payload byte
-
-    while(UCA0STAT & UCBUSY);   // Wait for buffer
-    UCA0TXBUF = *payload++;     // Transmit payload byte
-
-    while(UCA0STAT & UCBUSY);   // Wait for buffer
-    UCA0TXBUF = *payload++;     // Transmit payload byte
-
-    while(UCA0STAT & UCBUSY);   // Wait for buffer
-    UCA0TXBUF = *payload++;     // Transmit payload byte
-
-    while(UCA0STAT & UCBUSY);   // Wait for transaction to complete
-    UCA0RXBUF;                  // Dummy read to clear flags
-
-    __delay_cycles(2);
-
-    CS_PORT_OUT |= active->cs_pin;
+    DIAG1_IRQ_OUT |= DIAG1_IRQ_PIN;
+    DIAG1_IRQ_DIR &= ~DIAG1_IRQ_PIN;
 }
 
-static void readRegister (void)
+// Write local driver enable outputs and monitoring mask
+static void writeEnable (trinamic2130_t *driver)
 {
-    uint8_t *payload = active->payload;
+    // Byte reverse data value as endianess differ
+    // using axes.reg.value = driver->reg.payload.value fails
+    axes.reg.data[0] = driver->reg.payload.data[3];
+    axes.reg.data[1] = driver->reg.payload.data[2];
+    axes.reg.data[2] = driver->reg.payload.data[1];
+    axes.reg.data[3] = driver->reg.payload.data[0];
 
-    // Transmit dummy read transaction so driver can prepare response
+    if(axes.reg.enable.x)
+        ENA_PORT_OUT &= ~ENA_PIN_X;
+    else
+        ENA_PORT_OUT |= ENA_PIN_X;
 
-    CS_PORT_OUT &= ~active->cs_pin;
+    if(axes.reg.enable.y)
+        ENA_PORT_OUT &= ~ENA_PIN_Y;
+    else
+        ENA_PORT_OUT |= ENA_PIN_Y;
 
-    UCA0TXBUF = payload[0];     // Send register address, increment data pointer and
-    while(UCA0STAT & UCBUSY);   // wait for transmission to finish
+    if(axes.reg.enable.z)
+        ENA_PORT_OUT &= ~ENA_PIN_Z;
+    else
+        ENA_PORT_OUT |= ENA_PIN_Z;
 
-    UCA0TXBUF = 0;              // Send dummy payload data, increment data pointer and
-    while(UCA0STAT & UCBUSY);   // wait for transmission to finish
+    __delay_cycles(200);
+}
 
-    UCA0TXBUF = 0;              // Send dummy payload data, increment data pointer and
-    while(UCA0STAT & UCBUSY);   // wait for transmission to finish
+// Write driver register
+static void writeRegister (trinamic2130_t *driver)
+{
+    uint8_t *payload = (uint8_t *)&(driver->reg.payload.data);
 
-    UCA0TXBUF = 0;              // Send dummy payload data, increment data pointer and
-    while(UCA0STAT & UCBUSY);   // wait for transmission to finish
-
-    UCA0TXBUF = 0;              // Send dummy payload data, increment data pointer and
-    while(UCA0STAT & UCBUSY);   // wait for transmission to finish
+    CS_PORT_OUT &= ~driver->cs_pin;
 
     __delay_cycles(2);
 
-    CS_PORT_OUT |= active->cs_pin;
+    while(UCA0STAT & UCBUSY);
+    UCA0TXBUF = driver->reg.addr.value;
+
+    while(UCA0STAT & UCBUSY);
+    UCA0TXBUF = *payload++;
+
+    while(UCA0STAT & UCBUSY);
+    UCA0TXBUF = *payload++;
+
+    while(UCA0STAT & UCBUSY);
+    UCA0TXBUF = *payload++;
+
+    while(UCA0STAT & UCBUSY);
+    UCA0TXBUF = *payload++;
+
+    while(UCA0STAT & UCBUSY);
+    UCA0RXBUF;
 
     __delay_cycles(2);
 
-    // Transmit actual read transaction
+    CS_PORT_OUT |= driver->cs_pin;
+}
 
-    CS_PORT_OUT &= ~active->cs_pin;
+// Read TMC or local register and transmit back to master
+// NOTE: register structs are not readable by debugger due to differing endianness
+static void readRegister (trinamic2130_t *driver)
+{
+    uint8_t *payload = (uint8_t *)&(driver->reg);
 
-    UCA0TXBUF = payload[0];     // Send register address, increment data pointer and
-    while(UCA0STAT & UCBUSY);   // wait for transmission to finish
-    *payload++ = UCA0RXBUF;     // Read and save response (status register)
+    if(driver->reg.addr.reg == TMC_I2CReg_MON_STATE) {
 
-    i2c.tx_count = 0;           // we now have valid data for I2C read to start...
+        i2c.data[0] = drvstat.value;
+        i2c.data[1] = diag_data.data[3];
+        i2c.data[2] = diag_data.data[2];
+        i2c.data[3] = diag_data.data[1];
+        i2c.data[4] = diag_data.data[0];
+        i2c.tx_data = i2c.data;
+        i2c.tx_count = 0;           // we now have valid data for I2C read to start...
 
-    UCA0TXBUF = 0;              // Send dummy payload data, increment data pointer and
-    while(UCA0STAT & UCBUSY);   // wait for transmission to finish
-    *payload++ = UCA0RXBUF;     // Read and save response
+    } else {
 
-    UCA0TXBUF = 0;              // Send dummy payload data, increment data pointer and
-    while(UCA0STAT & UCBUSY);   // wait for transmission to finish
-    *payload++ = UCA0RXBUF;     // Read and save response
+        // Transmit dummy read transaction so driver can prepare response
 
-    UCA0TXBUF = 0;              // Send dummy payload data, increment data pointer and
-    while(UCA0STAT & UCBUSY);   // wait for transmission to finish
-    *payload++ = UCA0RXBUF;     // Read and save response
+        CS_PORT_OUT &= ~driver->cs_pin;
 
-    UCA0TXBUF = 0;              // Send dummy payload data, increment data pointer and
-    while(UCA0STAT & UCBUSY);   // wait for transmission to finish
-    *payload++ = UCA0RXBUF;     // Read and save response
+        UCA0TXBUF = driver->reg.addr.value;
+        while(UCA0STAT & UCBUSY);
 
-    CS_PORT_OUT |= active->cs_pin;
+        UCA0TXBUF = 0;
+        while(UCA0STAT & UCBUSY);
+
+        UCA0TXBUF = 0;
+        while(UCA0STAT & UCBUSY);
+
+        UCA0TXBUF = 0;
+        while(UCA0STAT & UCBUSY);
+
+        UCA0TXBUF = 0;
+        while(UCA0STAT & UCBUSY);
+
+        __delay_cycles(2);
+
+        CS_PORT_OUT |= driver->cs_pin;
+
+        __delay_cycles(2);
+
+        // Transmit actual read transaction
+
+        CS_PORT_OUT &= ~driver->cs_pin;
+
+        UCA0TXBUF = driver->reg.addr.value;
+        while(UCA0STAT & UCBUSY);
+        *payload++ = UCA0RXBUF;
+
+        i2c.tx_count = 0; // We now have valid data for I2C read to start, I2C is slower than SPI so it will not catch up
+
+        UCA0TXBUF = 0;
+        while(UCA0STAT & UCBUSY);
+        *payload++ = UCA0RXBUF;
+
+        UCA0TXBUF = 0;
+        while(UCA0STAT & UCBUSY);
+        *payload++ = UCA0RXBUF;
+
+        UCA0TXBUF = 0;
+        while(UCA0STAT & UCBUSY);
+        *payload++ = UCA0RXBUF;
+
+        UCA0TXBUF = 0;
+        while(UCA0STAT & UCBUSY);
+        *payload++ = UCA0RXBUF;
+
+        CS_PORT_OUT |= driver->cs_pin;
+    }
+}
+
+// Read TMC register byte reversed for internal use
+static void readRegisterBR (trinamic2130_t *driver, TMC2130_datagram_t *datagram)
+{
+    uint8_t *payload = (uint8_t *)&(datagram->payload) + 3;
+
+    if(datagram->addr.reg == TMC_I2CReg_ENABLE) {
+
+        i2c.tx_data = (uint8_t *)&axes.reg.value;
+        i2c.tx_count = 0;           // we now have valid data for I2C read to start...
+
+    } else {
+
+        // Transmit dummy read transaction so driver can prepare response
+
+        CS_PORT_OUT &= ~driver->cs_pin;
+
+        UCA0TXBUF = datagram->addr.value;
+        while(UCA0STAT & UCBUSY);
+
+        UCA0TXBUF = 0;
+        while(UCA0STAT & UCBUSY);
+
+        UCA0TXBUF = 0;
+        while(UCA0STAT & UCBUSY);
+
+        UCA0TXBUF = 0;
+        while(UCA0STAT & UCBUSY);
+
+        UCA0TXBUF = 0;
+        while(UCA0STAT & UCBUSY);
+
+        __delay_cycles(2);
+
+        CS_PORT_OUT |= driver->cs_pin;
+
+        __delay_cycles(2);
+
+        // Transmit actual read transaction
+
+        CS_PORT_OUT &= ~driver->cs_pin;
+
+        UCA0TXBUF = datagram->addr.value;
+        while(UCA0STAT & UCBUSY);
+        driver->response.value = UCA0RXBUF;
+
+        UCA0TXBUF = 0;
+        while(UCA0STAT & UCBUSY);
+        *payload-- = UCA0RXBUF;
+
+        UCA0TXBUF = 0;
+        while(UCA0STAT & UCBUSY);
+        *payload-- = UCA0RXBUF;
+
+        UCA0TXBUF = 0;
+        while(UCA0STAT & UCBUSY);
+        *payload-- = UCA0RXBUF;
+
+        UCA0TXBUF = 0;
+        while(UCA0STAT & UCBUSY);
+        *payload-- = UCA0RXBUF;
+
+        CS_PORT_OUT |= driver->cs_pin;
+    }
+}
+
+// Poll for driver status and report via interrupt request to driver if attention is required
+// Poll rate is 500 mS
+static void pollEvent (void)
+{
+    uint16_t idx = NUM_AXIS, mask = 0x01 << (NUM_AXIS - 1);
+    bool fatal = false, warning = false;
+
+    diag_data.ot.mask = 0;
+    diag_data.otpw.mask = 0;
+    diag_data.otpw_cnt.mask = 0;
+    diag_data.error.mask = 0;
+
+    do {
+        idx--;
+        if(axes.reg.monitor.mask & mask) {
+
+            readRegisterBR(&driver[idx], (TMC2130_datagram_t *)&(driver[idx].status));
+
+            if(driver[idx].status.reg.ot) {
+                diag_data.ot.mask |= mask;
+                fatal = true; // TODO: break here since this is a fatal error?
+            }
+
+            if(driver[idx].status.reg.otpw) {
+                diag_data.otpw.mask |= mask;
+                if(driver[idx].otpw_count == 0)
+                    warning = true;
+                if(++driver[idx].otpw_count == driver[idx].otpw_max) {
+                    warning = true;
+                    diag_data.otpw_cnt.mask |= mask;
+                }
+            } else
+                driver[idx].otpw_count = 0;
+
+            // Check olb, ola, s2gb, s2gb and driver_error flag for errors
+            if((driver[idx].status.reg.value & 0x78000000UL) || driver[idx].response.driver_error) {
+                diag_data.error.mask |= mask;
+                fatal = true; // TODO: break here since this is a fatal error?
+            }
+        }
+
+        mask >>= 1;
+
+    } while(idx);
+
+    if(fatal) {
+
+        DIAG1_IRQ_DIR |= DIAG1_IRQ_PIN;
+        DIAG1_IRQ_OUT &= ~DIAG1_IRQ_PIN;
+
+        __delay_cycles(32); // ~1uS IRQ pulse
+
+        DIAG1_IRQ_OUT |= DIAG1_IRQ_PIN;
+        DIAG1_IRQ_DIR &= ~DIAG1_IRQ_PIN;
+
+    }
+
+    if(warning) {
+
+        WARN_IRQ_DIR |= DIAG1_IRQ_PIN;
+        WARN_IRQ_OUT &= ~DIAG1_IRQ_PIN;
+
+        __delay_cycles(32); // ~1uS IRQ pulse
+
+        WARN_IRQ_OUT |= DIAG1_IRQ_PIN;
+        WARN_IRQ_DIR &= ~DIAG1_IRQ_PIN;
+    }
 }
 
 void main (void)
 {
-    WDTCTL = WDTPW | WDTHOLD;	// Stop watchdog timer
+    WDTCTL = WDTPW | WDTHOLD;   // Stop watchdog timer
     DCOCTL = CALDCO_16MHZ;      // Set DCO for 16 MHz using
     BCSCTL1 = CALBC1_16MHZ;     // calibration registers
 //    BCSCTL2 &= ~(DIVS1|DIVS0);
@@ -181,6 +388,44 @@ void main (void)
     SPI_PORT_SEL2 |= MOSI_PIN|MISO_PIN|SCLK_PIN;
 
     CS_PORT_DIR |= CS_PIN_MASK;
+    CS_PORT_OUT |= CS_PIN_MASK;
+    P2SEL &= ~BIT6;
+    ENA_PORT_DIR |= ENA_PIN_MASK;
+    ENA_PORT_OUT &= ~ENA_PIN_MASK;
+
+    DIAG1_X_OUT |= DIAG1_X_PIN;
+    DIAG1_X_REN |= DIAG1_X_PIN;
+    DIAG1_X_IES |= DIAG1_X_PIN;
+    __delay_cycles(25);
+    DIAG1_X_IFG &= ~DIAG1_X_PIN;
+    DIAG1_X_IE  |= DIAG1_X_PIN;
+
+    DIAG1_Y_OUT |= DIAG1_Y_PIN;
+    DIAG1_Y_REN |= DIAG1_Y_PIN;
+    DIAG1_Y_IES |= DIAG1_Y_PIN;
+    __delay_cycles(25);
+    DIAG1_Y_IFG &= ~DIAG1_Y_PIN;
+    DIAG1_Y_IE  |= DIAG1_Y_PIN;
+
+#ifdef DIAG1_Z_SEL
+    DIAG1_Z_SEL &= ~DIAG1_Z_PIN;
+#endif
+    DIAG1_Z_OUT |= DIAG1_Z_PIN;
+    DIAG1_Z_REN |= DIAG1_Z_PIN;
+    DIAG1_Z_IES |= DIAG1_Z_PIN;
+    __delay_cycles(25);
+    DIAG1_Z_IFG &= ~DIAG1_Z_PIN;
+    DIAG1_Z_IE  |= DIAG1_Z_PIN;
+
+    TA0CCR0 = 15999;                // 1ms timer
+    TA0CCTL0 = CCIE;                // Enable CCR0 interrupt|                            // Start TA0 in up mode
+    TA0CTL = TASSEL1|TACLR|MC0;     // bind to SMCLK and clear TA
+
+    uint16_t idx;
+    for(idx = 0; idx < NUM_AXIS; idx++) {
+        driver[idx].status.addr.reg = TMC2130Reg_DRV_STATUS;
+        driver[idx].otpw_max = 4;
+    }
 
     driver[0].cs_pin = CS_PIN_X;
     driver[1].cs_pin = CS_PIN_Y;
@@ -211,48 +456,52 @@ void main (void)
 
     _EINT();                        // Enable interrupts
 
+    uint8_t ifg = IFG2, ie = IE2;
+
     while(true) {
 
         LPM0;
 
-        switch(i2c.cmd) {
+        if (i2c.cmd & CMD_ReadRegister)
+            readRegister(active);
 
-            case CMD_ReadRegister:
-                readRegister();
-                i2c.cmd = CMD_Idle;
-                break;
+        if (i2c.cmd & I2C_WriteRegister)
+            writeRegister(active);
 
-            case I2C_WriteRegister:
-                writeRegister();
-                i2c.cmd = CMD_Idle;
-                break;
-        }
+        if (i2c.cmd & I2C_WriteEnable)
+            writeEnable(active);
+
+        if (i2c.cmd & I2C_Diag1Event)
+            diag1Event();
+
+        if (i2c.cmd &  I2C_PollEvent)
+            pollEvent();
+
+        i2c.cmd = CMD_Idle;
     }
 }
 
 #pragma vector = USCIAB0TX_VECTOR
 __interrupt void USCIAB0TX_ISR(void)
 {
-    uint8_t ifg = IFG2, ie = IE2;
-
-    if(IFG2 & UCB0TXIFG)
-        UCB0TXBUF = (i2c.tx_count++ < 5) ? *i2c.tx_data++ : 0xFF;    // Transmit register content
+    if(IFG2 & UCB0TXIFG) {
+        UCB0TXBUF = i2c.tx_count++ <= 5 ? *i2c.tx_data++ : 0xFF;    // Transmit register content
+        if(i2c.tx_count == 5)
+            i2c.rx_pending = false;
+    }
 
     if(IFG2 & UCB0RXIFG) {
         if(i2c.rx_count < 5) {
             *i2c.rx_data++ = UCB0RXBUF;
             if(++i2c.rx_count == 1) {
-                active = &driver[(i2c.data[0] >> 5) & 0x03];             // set active driver TODO: add range check?
-                i2c.data[0] = TMC2130_I2C_regmap[(i2c.data[0] & 0x1FU)]; // restore original register address
-                active->addr = (i2c.data[0] & 0x7F);
-                if(!(i2c.data[0] & 0x80)) {
-                    active->payload[0] = i2c.data[0];
-                    active->payload[1] = 0;
-                    active->payload[2] = 0;
-                    active->payload[3] = 0;
-                    active->payload[4] = 0;
-                    i2c.tx_data = active->payload;
-                    i2c.cmd = CMD_ReadRegister;
+                uint16_t idx = (i2c.data[0] >> 5) & 0x03;
+                active = &driver[idx];             // set active driver TODO: add range check?
+                active->reg.addr.value = TMC2130_I2C_regmap[(i2c.data[0] & 0x1FU)]; // restore original register address;
+                i2c.rx_data = (uint8_t *)&(active->reg.payload);
+                if(!active->reg.addr.write) {
+                    i2c.tx_data = (uint8_t *)&(active->reg);
+                    i2c.rx_pending = true;
+                    i2c.cmd |= CMD_ReadRegister;
                     LPM0_EXIT;
                 }
             }
@@ -271,13 +520,50 @@ __interrupt void USCIAB0RX_ISR(void)
     }
 
     if(intstate & UCSTPIFG) {
-        i2c.tx_count = 5; // Safe value in case a out-of-order read is issued
-        if(i2c.rx_count == 5 && i2c.data[0] & 0x80) {
-            memcpy(active->payload, i2c.data, sizeof(active->payload));
-            i2c.cmd = I2C_WriteRegister;
+        if(!i2c.rx_pending)
+            i2c.tx_count = 5; // Safe value in case a out-of-order read is issued
+        if(i2c.rx_count == 5 && active->reg.addr.write) {
+            i2c.cmd |= active->reg.addr.idx == TMC_I2CReg_ENABLE ? I2C_WriteEnable : I2C_WriteRegister;
             LPM0_EXIT;
         }
     }
 
     UCB0STAT &= ~intstate;      // Clear interrupt flags
+}
+
+#pragma vector=PORT1_VECTOR
+__interrupt void P1_ISR(void)
+{
+    diag1_event.x = (DIAG1_X_IFG & DIAG1_X_PIN) != 0;
+    diag1_event.y = (DIAG1_Y_IFG & DIAG1_Y_PIN) != 0;
+
+    P1IFG = 0;
+    i2c.cmd |= I2C_Diag1Event;
+
+    LPM0_EXIT;
+}
+
+#pragma vector=PORT2_VECTOR
+__interrupt void P2_ISR(void)
+{
+    diag1_event.z = (DIAG1_Z_IFG & DIAG1_Z_PIN) == 0;
+
+    P2IFG = 0;
+    i2c.cmd |= I2C_Diag1Event;
+
+    LPM0_EXIT;
+}
+
+#pragma vector=TIMER0_A0_VECTOR
+__interrupt void CCR0_ISR(void)
+{
+    static volatile uint16_t msec = 0;
+
+    msec++;
+
+    if(msec == 499) {
+        i2c.cmd |= I2C_PollEvent;
+        msec = 0;
+        LPM0_EXIT;
+    }
 }

@@ -3,12 +3,12 @@
 //
 // Target: MSP430G2553
 //
-// v0.1 / 2018-11-11 / Io Engineering / Terje
+// v0.0.3 / 2019-07-23 / Io Engineering / Terje
 //
 
 /*
 
-Copyright (c) 2018, Terje Io
+Copyright (c) 2018-2019, Terje Io
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without modification,
@@ -40,13 +40,14 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <msp430.h>
 
-#ifndef _OLEDDRIVER_H_
-#define _OLEDDRIVER_H_
+#ifndef _TMCBRIDGE_CONFIG_H_
+#define _TMCBRIDGE_CONFIG_H_
 
 #include <stdint.h>
 
 #include "portmacros.h"
 
+#define NUM_AXIS 3
 #define I2C_ADR_I2CBRIDGE    0x47
 
 #define SPI A0
@@ -77,6 +78,53 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #define CS_PORT_OUT   portOut(CS_PORT)
 #define CS_PORT_DIR   portDir(CS_PORT)
+
+#define ENA_PORT 2
+#define ENA_PIN_X BIT6
+#define ENA_PIN_Y BIT5
+#define ENA_PIN_Z BIT4
+#define ENA_PIN_MASK (ENA_PIN_X|ENA_PIN_Y|ENA_PIN_Z)
+
+#define ENA_PORT_OUT   portOut(ENA_PORT)
+#define ENA_PORT_DIR   portDir(ENA_PORT)
+
+#define WARN_IRQ_PORT   2
+#define WARN_IRQ_PIN    BIT0
+#define WARN_IRQ_OUT    portOut(WARN_IRQ_PORT)
+#define WARN_IRQ_DIR    portDir(WARN_IRQ_PORT)
+
+#define DIAG1_IRQ_PORT  1
+#define DIAG1_IRQ_PIN   BIT0
+#define DIAG1_IRQ_OUT   portOut(DIAG1_IRQ_PORT)
+#define DIAG1_IRQ_DIR   portDir(DIAG1_IRQ_PORT)
+
+#define DIAG1_X_PORT    1
+#define DIAG1_X_PIN     BIT5
+#define DIAG1_X_IN      portIn(DIAG1_X_PORT)
+#define DIAG1_X_OUT     portOut(DIAG1_X_PORT)
+#define DIAG1_X_IE      portIe(DIAG1_X_PORT)
+#define DIAG1_X_IFG     portIfg(DIAG1_X_PORT)
+#define DIAG1_X_IES     portEs(DIAG1_X_PORT)
+#define DIAG1_X_REN     portRen(DIAG1_X_PORT)
+
+#define DIAG1_Y_PORT    1
+#define DIAG1_Y_PIN     BIT3
+#define DIAG1_Y_IN      portIn(DIAG1_Y_PORT)
+#define DIAG1_Y_OUT     portOut(DIAG1_Y_PORT)
+#define DIAG1_Y_IE      portIe(DIAG1_Y_PORT)
+#define DIAG1_Y_IFG     portIfg(DIAG1_Y_PORT)
+#define DIAG1_Y_IES     portEs(DIAG1_Y_PORT)
+#define DIAG1_Y_REN     portRen(DIAG1_Y_PORT)
+
+#define DIAG1_Z_PORT    2
+#define DIAG1_Z_PIN     BIT7
+#define DIAG1_Z_IN      portIn(DIAG1_Z_PORT)
+#define DIAG1_Z_OUT     portOut(DIAG1_Z_PORT)
+#define DIAG1_Z_IE      portIe(DIAG1_Z_PORT)
+#define DIAG1_Z_IFG     portIfg(DIAG1_Z_PORT)
+#define DIAG1_Z_IES     portEs(DIAG1_Z_PORT)
+#define DIAG1_Z_REN     portRen(DIAG1_Z_PORT)
+#define DIAG1_Z_SEL     portSel(DIAG1_Z_PORT,)
 
 #define I2C B0
 #define I2C_CTL0 usciCTL(I2C, 0)
