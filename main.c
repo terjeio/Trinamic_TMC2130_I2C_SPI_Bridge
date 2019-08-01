@@ -38,6 +38,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 */
 
+// http://e2e.ti.com/support/microcontrollers/msp430/f/166/t/369949
+
 #include <msp430.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -185,6 +187,7 @@ static void readRegister (trinamic2130_t *driver)
         i2c.data[4] = diag_data.data[0];
         i2c.tx_data = i2c.data;
         i2c.tx_count = 0;           // we now have valid data for I2C read to start...
+        UCB0I2CIE |= UCSTTIE;
 
     } else {
 
@@ -221,7 +224,8 @@ static void readRegister (trinamic2130_t *driver)
         while(UCA0STAT & UCBUSY);
         *payload++ = UCA0RXBUF;
 
-        i2c.tx_count = 0; // We now have valid data for I2C read to start, I2C is slower than SPI so it will not catch up
+//        i2c.tx_count = 0; // We now have valid data for I2C read to start, I2C is slower than SPI so it will not catch up
+        UCB0I2CIE |= UCSTTIE;
 
         UCA0TXBUF = 0;
         while(UCA0STAT & UCBUSY);
@@ -345,7 +349,7 @@ static void pollEvent (void)
             // Check olb, ola, s2gb, s2gb and driver_error flag for errors
             if((driver[idx].status.reg.value & 0x78000000UL) || driver[idx].response.driver_error) {
                 diag_data.error.mask |= mask;
-                fatal = true; // TODO: break here since this is a fatal error?
+//                fatal = true; // TODO: break here since this is a fatal error?
             }
         }
 
@@ -484,11 +488,8 @@ void main (void)
 #pragma vector = USCIAB0TX_VECTOR
 __interrupt void USCIAB0TX_ISR(void)
 {
-    if(IFG2 & UCB0TXIFG) {
-        UCB0TXBUF = i2c.tx_count++ <= 5 ? *i2c.tx_data++ : 0xFF;    // Transmit register content
-        if(i2c.tx_count == 5)
-            i2c.rx_pending = false;
-    }
+    if(IFG2 & UCB0TXIFG)
+        UCB0TXBUF = *i2c.tx_data++;    // Transmit register content
 
     if(IFG2 & UCB0RXIFG) {
         if(i2c.rx_count < 5) {
@@ -499,13 +500,14 @@ __interrupt void USCIAB0TX_ISR(void)
                 active->reg.addr.value = TMC2130_I2C_regmap[(i2c.data[0] & 0x1FU)]; // restore original register address;
                 i2c.rx_data = (uint8_t *)&(active->reg.payload);
                 if(!active->reg.addr.write) {
+                    UCB0I2CIE &= ~UCSTTIE;
                     i2c.tx_data = (uint8_t *)&(active->reg);
-                    i2c.rx_pending = true;
                     i2c.cmd |= CMD_ReadRegister;
                     LPM0_EXIT;
                 }
             }
-        }
+        } else
+            UCB0RXBUF;
     }
 }
 
@@ -520,8 +522,7 @@ __interrupt void USCIAB0RX_ISR(void)
     }
 
     if(intstate & UCSTPIFG) {
-        if(!i2c.rx_pending)
-            i2c.tx_count = 5; // Safe value in case a out-of-order read is issued
+        UCB0I2CIE |= UCSTTIE;
         if(i2c.rx_count == 5 && active->reg.addr.write) {
             i2c.cmd |= active->reg.addr.idx == TMC_I2CReg_ENABLE ? I2C_WriteEnable : I2C_WriteRegister;
             LPM0_EXIT;
