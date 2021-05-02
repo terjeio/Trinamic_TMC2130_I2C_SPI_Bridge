@@ -11,4 +11,4 @@ A second signal \(warning\) to master is available for overtemperature prewarnin
 The fault and warning signals are open drain active low signals and may be used to trigger interrupts in the master.
 
 ---
-2019-07-23
+2021-05-01

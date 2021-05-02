@@ -3,12 +3,12 @@
 //
 // Target: MSP430G2553
 //
-// v0.0.3 / 2019-07-23 / Io Engineering / Terje
+// v0.0.4 / 2021-02-06 / Io Engineering / Terje
 //
 
 /*
 
-Copyright (c) 2018-2019, Terje Io
+Copyright (c) 2018-2021, Terje Io
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without modification,
@@ -46,15 +46,16 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "string.h"
 
 #include "config.h"
-#include "trinamic/TMC2130_I2C_map.h"
+#include "trinamic/tmc2130.h"
+#include "trinamic/tmc_i2c_interface.h"
 
 typedef struct {
     uint8_t otpw_count;
     uint8_t otpw_max;
     uint8_t cs_pin;
-    TMC2130_datagram_t reg;
+    TMC_spi_datagram_t reg;
     TMC2130_drv_status_dgr_t status;
-    TMC2130_status_t response;
+    TMC_spi_status_t response;
 } trinamic2130_t;
 
 typedef enum {
@@ -72,7 +73,8 @@ typedef enum {
     I2C_WriteRegister = 0x02,
     I2C_WriteEnable = 0x04,
     I2C_Diag1Event = 0x08,
-    I2C_PollEvent = 0x10 // every 500 mS
+    I2C_PollEvent = 0x10, // every 500 mS
+    I2C_SelectAxis = 0x20
 } i2c_cmd;
 
 typedef struct {
@@ -178,7 +180,7 @@ static void readRegister (trinamic2130_t *driver)
 {
     uint8_t *payload = (uint8_t *)&(driver->reg);
 
-    if(driver->reg.addr.reg == TMC_I2CReg_MON_STATE) {
+    if(driver->reg.addr.idx == TMC_I2CReg_MON_STATE) {
 
         i2c.data[0] = drvstat.value;
         i2c.data[1] = diag_data.data[3];
@@ -290,7 +292,7 @@ static void readRegisterBR (trinamic2130_t *driver, TMC2130_datagram_t *datagram
 
         UCA0TXBUF = datagram->addr.value;
         while(UCA0STAT & UCBUSY);
-        driver->response.value = UCA0RXBUF;
+        driver->response = UCA0RXBUF;
 
         UCA0TXBUF = 0;
         while(UCA0STAT & UCBUSY);
@@ -345,12 +347,12 @@ static void pollEvent (void)
                 }
             } else
                 driver[idx].otpw_count = 0;
-
+/*
             // Check olb, ola, s2gb, s2gb and driver_error flag for errors
             if((driver[idx].status.reg.value & 0x78000000UL) || driver[idx].response.driver_error) {
                 diag_data.error.mask |= mask;
 //                fatal = true; // TODO: break here since this is a fatal error?
-            }
+            }*/
         }
 
         mask >>= 1;
@@ -422,7 +424,7 @@ void main (void)
     DIAG1_Z_IE  |= DIAG1_Z_PIN;
 
     TA0CCR0 = 15999;                // 1ms timer
-    TA0CCTL0 = CCIE;                // Enable CCR0 interrupt|                            // Start TA0 in up mode
+//    TA0CCTL0 = CCIE;                // Enable CCR0 interrupt|                            // Start TA0 in up mode
     TA0CTL = TASSEL1|TACLR|MC0;     // bind to SMCLK and clear TA
 
     uint16_t idx;
@@ -466,6 +468,11 @@ void main (void)
 
         LPM0;
 
+        if (i2c.cmd & I2C_SelectAxis) {
+            readRegister(active);
+            active = &driver[i2c.data[0] & 0x7F];
+        }
+
         if (i2c.cmd & CMD_ReadRegister)
             readRegister(active);
 
@@ -478,7 +485,7 @@ void main (void)
         if (i2c.cmd & I2C_Diag1Event)
             diag1Event();
 
-        if (i2c.cmd &  I2C_PollEvent)
+        if (i2c.cmd & I2C_PollEvent)
             pollEvent();
 
         i2c.cmd = CMD_Idle;
@@ -495,9 +502,7 @@ __interrupt void USCIAB0TX_ISR(void)
         if(i2c.rx_count < 5) {
             *i2c.rx_data++ = UCB0RXBUF;
             if(++i2c.rx_count == 1) {
-                uint16_t idx = (i2c.data[0] >> 5) & 0x03;
-                active = &driver[idx];             // set active driver TODO: add range check?
-                active->reg.addr.value = TMC2130_I2C_regmap[(i2c.data[0] & 0x1FU)]; // restore original register address;
+                active->reg.addr.value = i2c.data[0];
                 i2c.rx_data = (uint8_t *)&(active->reg.payload);
                 if(!active->reg.addr.write) {
                     UCB0I2CIE &= ~UCSTTIE;
@@ -523,7 +528,11 @@ __interrupt void USCIAB0RX_ISR(void)
 
     if(intstate & UCSTPIFG) {
         UCB0I2CIE |= UCSTTIE;
-        if(i2c.rx_count == 5 && active->reg.addr.write) {
+        if(i2c.rx_count == 1) {
+            i2c.cmd = I2C_SelectAxis;
+            LPM0_EXIT;
+        }
+        if(i2c.rx_count == 5) {
             i2c.cmd |= active->reg.addr.idx == TMC_I2CReg_ENABLE ? I2C_WriteEnable : I2C_WriteRegister;
             LPM0_EXIT;
         }
@@ -563,8 +572,10 @@ __interrupt void CCR0_ISR(void)
     msec++;
 
     if(msec == 499) {
-        i2c.cmd |= I2C_PollEvent;
         msec = 0;
-        LPM0_EXIT;
+        if(i2c.cmd == CMD_Idle) {
+            i2c.cmd |= I2C_PollEvent;
+            LPM0_EXIT;
+        }
     }
 }
